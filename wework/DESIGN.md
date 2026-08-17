@@ -271,6 +271,20 @@ Required semantic results:
 These are reference values. Product code must consume semantic Wework tokens,
 not scatter literals. Every reusable token must define both themes.
 
+Theme-aware application chrome must use semantic tokens even when a component
+has multiple layout variants. A prop such as compact, remote, mobile, or
+embedded may change spacing and composition, but it must not select a
+light-only or dark-only color recipe. Apply this rule to nested surfaces as
+well as their containers: dialogs, directory pickers, menus, inputs, list rows,
+tooltips, footers, and action groups must all inherit the active theme.
+
+Literal white, black, or neutral fills are allowed only when color is part of
+the content contract rather than application chrome. Examples include a QR
+code's required white quiet zone, an authored HTML document or image canvas, a
+syntax-highlighted code theme, a brand icon, and native window controls. Keep
+these exceptions narrow and visually contained; do not use them to justify a
+light-only panel or control.
+
 Surfaces should be separated in this order: spacing, a small neutral tone
 change, a hairline, then elevation. Do not jump directly to a bordered card.
 
@@ -525,6 +539,8 @@ recipe closely:
   shadow;
 - do not add a dark visible border in the normal state; forced-color mode may
   add an explicit outline;
+- the default desktop input starts at two text lines; compact composers start
+  at one line and grow only when content requires it;
 - multiline input horizontal inset is `12px`;
 - attachment inset is `8px`, with the nested radius derived from the outer
   composer radius rather than chosen independently;
@@ -553,6 +569,10 @@ recipe closely:
   Short threads therefore fill the viewport while long and virtualized threads
   grow naturally. Keep bottom following stable across delayed virtual
   measurements, but stop following immediately after an explicit user scroll.
+- When guidance or another runtime event inserts, removes, or reorders messages
+  inside a virtualized thread, remeasure mounted rows from the first changed
+  index. The virtual container must include every rendered row so no message can
+  appear below or behind the sticky composer.
 
 The Composer is not a green brand block, a thick outlined form, or a card with
 an exaggerated shadow.
@@ -699,6 +719,11 @@ semantics for all three.
   active task and unsent composer input.
 - Opening the bottom workspace panel starts or restores its Terminal directly;
   it must not show an IDE launcher or require an intermediate tool choice.
+- 底部工作区面板可缩小到仅显示一行终端；最小高度必须根据当前代码
+  字号、面板控件高度和终端内边距计算，不得使用较大的固定像素下限。
+- The bottom workspace panel may be resized down to one visible terminal row.
+  Its minimum height must derive from the current code font size plus the panel
+  chrome and terminal padding instead of using a fixed large pixel minimum.
 - Terminal sessions may remain mounted while the bottom panel is hidden so the
   shell session and scrollback survive panel restoration. Only the active
   terminal should be fitted and resized; after activation, window focus, or
@@ -720,6 +745,11 @@ semantics for all three.
 
 ### 7.3 Runtime and conversation state
 
+- 分栏中的编辑器状态必须按任务作用域隔离，包括未发送文本、附件、上传进度和
+  上传错误；一个分栏的粘贴、移除或发送操作不得改变其他分栏的编辑器。
+- Composer state in split panes must be isolated by task scope, including
+  unsent text, attachments, upload progress, and upload errors. Pasting,
+  removing, or sending in one pane must not change another pane's composer.
 - Keep task execution lifecycle state separate from conversation delivery
   state. The runtime task state machine owns execution, turns, and goals; the
   conversation queue reducer owns queued messages and guidance delivery.

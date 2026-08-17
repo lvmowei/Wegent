@@ -880,7 +880,7 @@ async fn runtime_tasks_fork_completed_turn_preserves_workspace_and_rejects_missi
             .to_string(),
     );
     let log_path = temp_path("runtime-fork-turn-log", "jsonl");
-    let fake_codex = write_fake_codex(&log_path);
+    let fake_codex = write_fake_codex_for_turns(&log_path, 2);
     let handler = RuntimeWorkRpcHandler::new("device-1", fake_codex.display().to_string());
 
     let created = handler
@@ -1005,6 +1005,19 @@ async fn runtime_tasks_send_ephemeral_codex_thread_uses_loaded_thread_directly()
     wait_for_turn_count(&log_path, 1).await;
     wait_until_task_idle(&handler, "side-chat-follow-up").await;
 
+    let transcript = handler
+        .handle_runtime_rpc(json!({
+            "method": "runtime.tasks.transcript",
+            "payload": {
+                "taskId": "side-chat-follow-up",
+                "workspacePath": "/tmp/project",
+                "refresh": true
+            }
+        }))
+        .await
+        .expect("ephemeral transcript should use the runtime cache");
+    assert_eq!(transcript["success"], true);
+
     let sent = handler
         .handle_runtime_rpc(json!({
             "method": "runtime.tasks.send",
@@ -1032,7 +1045,6 @@ async fn runtime_tasks_send_ephemeral_codex_thread_uses_loaded_thread_directly()
     assert_eq!(sent["accepted"], true);
     wait_for_turn_count(&log_path, 2).await;
     wait_until_task_idle(&handler, "side-chat-follow-up").await;
-    wait_for_method_count(&log_path, "thread/unsubscribe", 2).await;
 
     let calls = read_json_lines(&log_path);
     assert_eq!(
@@ -1059,9 +1071,16 @@ async fn runtime_tasks_send_ephemeral_codex_thread_uses_loaded_thread_directly()
     assert_eq!(
         calls
             .iter()
+            .filter(|call| call["method"] == "thread/turns/list")
+            .count(),
+        0
+    );
+    assert_eq!(
+        calls
+            .iter()
             .filter(|call| call["method"] == "thread/unsubscribe")
             .count(),
-        2
+        0
     );
     assert_eq!(
         calls
@@ -3098,7 +3117,7 @@ async fn runtime_tasks_send_recovers_thread_from_unique_workspace_when_visible_t
 }
 
 #[tokio::test]
-async fn runtime_tasks_rollback_uses_nested_address_runtime_handle_without_local_index() {
+async fn runtime_tasks_rollback_replaces_the_source_turn_without_provider_rollback() {
     let _lock = env_lock().await;
     let _home = EnvGuard::set(
         "WEGENT_EXECUTOR_HOME",
@@ -3130,6 +3149,7 @@ async fn runtime_tasks_rollback_uses_nested_address_runtime_handle_without_local
                 },
                 "message": "edited from address handle",
                 "messageId": "user-last",
+                "retrySourceTurnId": "turn-1",
                 "executionRequest": codex_execution_request(
                     "edited from address handle",
                     "/tmp/project",
@@ -3141,16 +3161,23 @@ async fn runtime_tasks_rollback_uses_nested_address_runtime_handle_without_local
         .expect("rollback should be accepted");
     assert_eq!(rollback["accepted"], true);
 
-    wait_for_method_count(&log_path, "thread/rollback", 1).await;
     wait_for_method_count(&log_path, "turn/start", 1).await;
     wait_for_thread_mapping(&handler, "local-visible-task", "thread-1").await;
     let calls = read_json_lines(&log_path);
-    let rollback = calls
+    assert!(
+        calls.iter().all(|call| call["method"] != "thread/rollback"),
+        "message editing must not use the deprecated provider rollback"
+    );
+    let resume = calls
         .iter()
-        .find(|call| call["method"] == "thread/rollback")
-        .expect("rollback should use the nested runtime handle");
-    assert_eq!(rollback["params"]["threadId"], "thread-1");
-    assert_eq!(rollback["params"]["numTurns"], 1);
+        .find(|call| call["method"] == "thread/resume")
+        .expect("editing should resume and subscribe to the persistent thread");
+    assert_eq!(resume["params"]["threadId"], "thread-1");
+    let turn_start = calls
+        .iter()
+        .find(|call| call["method"] == "turn/start")
+        .expect("editing should start a replacement turn");
+    assert_eq!(turn_start["params"]["threadId"], "thread-1");
 }
 
 fn write_fake_codex(log_path: &Path) -> PathBuf {
@@ -3266,6 +3293,7 @@ fn write_fake_codex_ephemeral_two_turns(log_path: &Path) -> PathBuf {
         r#"#!/bin/sh
 LOG_PATH='{}'
 turn_count=0
+thread_loaded=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$LOG_PATH"
   request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -3279,6 +3307,7 @@ while IFS= read -r line; do
       printf '%s\n' '{{"id":'"$request_id"',"result":{{"data":[{{"id":"parent-thread-1","cwd":"/tmp/project","name":"Parent","preview":"parent","path":"/tmp/codex/parent-thread-1.jsonl","createdAt":1780000000,"updatedAt":1780000060,"status":"idle","turns":[]}}],"nextCursor":null,"backwardsCursor":null}}}}'
       ;;
     *'"method":"thread/fork"'*)
+      thread_loaded=1
       printf '%s\n' '{{"id":'"$request_id"',"result":{{"thread":{{"id":"thread-ephemeral"}}}}}}'
       ;;
     *'"method":"thread/inject_items"'*)
@@ -3291,13 +3320,18 @@ while IFS= read -r line; do
       printf '%s\n' '{{"id":'"$request_id"',"error":{{"message":"ephemeral thread should not resume"}}}}'
       ;;
     *'"method":"thread/unsubscribe"'*)
+      thread_loaded=0
       printf '%s\n' '{{"id":'"$request_id"',"result":{{"status":"unsubscribed"}}}}'
       ;;
     *'"method":"turn/start"'*)
-      turn_count=$((turn_count + 1))
-      printf '%s\n' '{{"id":'"$request_id"',"result":{{"turn":{{"id":"turn-'"$turn_count"'","status":"inProgress"}}}}}}'
-      printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-ephemeral","turnId":"turn-'"$turn_count"'","delta":"done '"$turn_count"'","phase":"finalAnswer"}}}}'
-      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-ephemeral","turn":{{"id":"turn-'"$turn_count"'","status":"completed"}}}}}}'
+      if [ "$thread_loaded" -eq 0 ]; then
+        printf '%s\n' '{{"id":'"$request_id"',"error":{{"message":"ephemeral thread is not loaded"}}}}'
+      else
+        turn_count=$((turn_count + 1))
+        printf '%s\n' '{{"id":'"$request_id"',"result":{{"turn":{{"id":"turn-'"$turn_count"'","status":"inProgress"}}}}}}'
+        printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-ephemeral","turnId":"turn-'"$turn_count"'","delta":"done '"$turn_count"'","phase":"finalAnswer"}}}}'
+        printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-ephemeral","turn":{{"id":"turn-'"$turn_count"'","status":"completed"}}}}}}'
+      fi
       ;;
   esac
 done
@@ -3919,6 +3953,7 @@ while IFS= read -r line; do
     *'"method":"turn/interrupt"'*)
       if printf '%s\n' "$line" | grep -q '"turnId":""'; then
         printf '%s\n' '{{"id":'"$request_id"',"result":{{}}}}'
+        printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-1","turn":{{"id":"turn-1","status":"cancelled"}}}}}}'
       else
         printf '%s\n' '{{"id":'"$request_id"',"error":{{"code":-32600,"message":"no active turn to interrupt"}}}}'
         printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-1","turn":{{"id":"turn-1","status":"inProgress"}}}}}}'
